@@ -2,39 +2,74 @@ const { Router } = require("express");
 const { pool } = require("../db");
 const router = Router();
 
-function getDefaultSchedule(timeSlot) {
-  if (timeSlot === "上午") {
-    return { start_time: "09:00:00", end_time: "11:30:00" };
-  } else if (timeSlot === "下午") {
-    return { start_time: "14:00:00", end_time: "17:00:00" };
-  }
-  return { start_time: "09:00:00", end_time: "17:00:00" };
-}
-
 function getTimeSlotByTime(timeStr) {
   const hour = parseInt(timeStr.split(":")[0]);
   if (hour < 12) return "上午";
   return "下午";
 }
 
-async function getScheduleForDate(lawyerId, dateStr) {
+function getDefaultTimeSlotConfig(timeSlot) {
+  if (timeSlot === "上午") {
+    return { time_slot: "上午", start_time: "09:00:00", end_time: "11:30:00" };
+  }
+  return { time_slot: "下午", start_time: "14:00:00", end_time: "17:00:00" };
+}
+
+async function getSchedulesForDate(lawyerId, dateStr) {
   const [schedules] = await pool.execute(
     "SELECT * FROM schedules WHERE lawyer_id = ? AND schedule_date = ? AND status = '正常'",
     [lawyerId, dateStr]
   );
-  if (schedules.length > 0) {
-    return schedules;
+  return schedules;
+}
+
+function matchScheduleForCheckIn(schedules, timeStr) {
+  const timeSlot = getTimeSlotByTime(timeStr);
+
+  if (!schedules || schedules.length === 0) {
+    return { schedule_id: null, ...getDefaultTimeSlotConfig(timeSlot) };
   }
-  const defaultSchedule = {
-    id: null,
-    lawyer_id: lawyerId,
-    schedule_date: dateStr,
-    time_slot: "全天",
-    start_time: "09:00:00",
-    end_time: "17:00:00",
-    status: "正常"
-  };
-  return [defaultSchedule];
+
+  let matched = schedules.find(s => s.time_slot === timeSlot);
+  if (matched) {
+    return { schedule_id: matched.id, time_slot: matched.time_slot, start_time: matched.start_time, end_time: matched.end_time };
+  }
+
+  matched = schedules.find(s => s.time_slot === "全天");
+  if (matched) {
+    return { schedule_id: matched.id, time_slot: "全天", start_time: matched.start_time, end_time: matched.end_time };
+  }
+
+  const first = schedules[0];
+  return { schedule_id: first.id, time_slot: first.time_slot, start_time: first.start_time, end_time: first.end_time };
+}
+
+function matchScheduleForCheckOut(schedules, checkInTimeStr, checkOutTimeStr) {
+  if (!schedules || schedules.length === 0) {
+    const timeSlot = getTimeSlotByTime(checkOutTimeStr);
+    return { schedule_id: null, ...getDefaultTimeSlotConfig(timeSlot) };
+  }
+
+  const checkInSlot = getTimeSlotByTime(checkInTimeStr);
+  const checkOutSlot = getTimeSlotByTime(checkOutTimeStr);
+
+  let matched = schedules.find(s => s.time_slot === "全天");
+  if (matched) {
+    return { schedule_id: matched.id, time_slot: "全天", start_time: matched.start_time, end_time: matched.end_time };
+  }
+
+  matched = schedules.find(s => s.time_slot === checkOutSlot);
+  if (matched) {
+    return { schedule_id: matched.id, time_slot: matched.time_slot, start_time: matched.start_time, end_time: matched.end_time };
+  }
+
+  matched = schedules.find(s => s.time_slot === checkInSlot);
+  if (matched) {
+    return { schedule_id: matched.id, time_slot: matched.time_slot, start_time: matched.start_time, end_time: matched.end_time };
+  }
+
+  const first = schedules[0];
+  return { schedule_id: first.id, time_slot: first.time_slot, start_time: first.start_time, end_time: first.end_time };
 }
 
 function calculateMinutesDiff(time1, time2) {
@@ -59,18 +94,11 @@ router.post("/check-in", async (req, res) => {
 
     const dateStr = checkInTime.toISOString().split("T")[0];
     const timeStr = checkInTime.toTimeString().split(" ")[0];
-    const timeSlot = getTimeSlotByTime(timeStr);
 
-    const schedules = await getScheduleForDate(lawyer_id, dateStr);
-    let matchedSchedule = schedules.find(s => 
-      s.time_slot === "全天" || s.time_slot === timeSlot
-    );
-    if (!matchedSchedule) {
-      matchedSchedule = schedules[0];
-    }
+    const schedules = await getSchedulesForDate(lawyer_id, dateStr);
+    const matched = matchScheduleForCheckIn(schedules, timeStr);
 
-    const startTime = matchedSchedule.start_time;
-    const lateMinutes = calculateMinutesDiff(timeStr, startTime);
+    const lateMinutes = calculateMinutesDiff(timeStr, matched.start_time);
     const isLate = lateMinutes > 15 ? 1 : 0;
 
     const [existing] = await conn.execute(
@@ -86,7 +114,7 @@ router.post("/check-in", async (req, res) => {
       `INSERT INTO attendance_records 
        (lawyer_id, schedule_id, check_in, is_late, status) 
        VALUES (?, ?, ?, ?, '正常')`,
-      [lawyer_id, matchedSchedule.id, checkInTime, isLate]
+      [lawyer_id, matched.schedule_id, checkInTime, isLate]
     );
 
     await conn.commit();
@@ -94,6 +122,8 @@ router.post("/check-in", async (req, res) => {
       id: result.insertId,
       message: "签到成功",
       check_in: checkInTime,
+      time_slot: matched.time_slot,
+      schedule_start_time: matched.start_time,
       is_late: !!isLate,
       late_minutes: lateMinutes > 0 ? lateMinutes : 0
     });
@@ -135,21 +165,26 @@ router.post("/check-out", async (req, res) => {
     const workMs = checkOutTime.getTime() - checkInTime.getTime();
     const workHours = Math.round((workMs / (1000 * 60 * 60)) * 10) / 10;
 
-    const timeStr = checkOutTime.toTimeString().split(" ")[0];
-    const timeSlot = getTimeSlotByTime(timeStr);
+    const checkInTimeStr = checkInTime.toTimeString().split(" ")[0];
+    const checkOutTimeStr = checkOutTime.toTimeString().split(" ")[0];
 
-    let scheduleEndTime = "17:00:00";
+    let schedules = [];
     if (record.schedule_id) {
-      const [schedules] = await conn.execute(
-        "SELECT end_time, time_slot FROM schedules WHERE id = ?",
+      const [scheds] = await conn.execute(
+        "SELECT * FROM schedules WHERE id = ?",
         [record.schedule_id]
       );
-      if (schedules.length > 0) {
-        scheduleEndTime = schedules[0].end_time;
-      }
+      schedules = scheds;
+    } else {
+      const [scheds] = await conn.execute(
+        "SELECT * FROM schedules WHERE lawyer_id = ? AND schedule_date = ? AND status = '正常'",
+        [lawyer_id, dateStr]
+      );
+      schedules = scheds;
     }
 
-    const earlyMinutes = calculateMinutesDiff(scheduleEndTime, timeStr);
+    const matched = matchScheduleForCheckOut(schedules, checkInTimeStr, checkOutTimeStr);
+    const earlyMinutes = calculateMinutesDiff(matched.end_time, checkOutTimeStr);
     const isEarlyLeave = earlyMinutes > 15 ? 1 : 0;
 
     await conn.execute(
@@ -180,6 +215,8 @@ router.post("/check-out", async (req, res) => {
       id: record.id,
       message: "签退成功",
       check_out: checkOutTime,
+      time_slot: matched.time_slot,
+      schedule_end_time: matched.end_time,
       work_hours: workHours,
       is_early_leave: !!isEarlyLeave,
       early_minutes: earlyMinutes > 0 ? earlyMinutes : 0

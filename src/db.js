@@ -93,7 +93,7 @@ async function initDb() {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         FOREIGN KEY (lawyer_id) REFERENCES lawyers(id),
         FOREIGN KEY (schedule_id) REFERENCES schedules(id),
-        INDEX idx_lawyer_date (lawyer_id, DATE(check_in))
+        INDEX idx_lawyer_checkin (lawyer_id, check_in)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
 
